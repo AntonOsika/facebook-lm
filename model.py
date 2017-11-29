@@ -13,16 +13,15 @@ from tensorflow.contrib.rnn import LSTMStateTuple
 MODEL_CHECKPOINT_NAME = "model.ckpt"
 MODEL_CHECKPOINT_REGEX = r"^model\.ckpt-(\d+)"
 
-def sample(logits, temperature=0.000000000003):
+def sample(logits, temperature=0.0):
     # helper function to sample an index from a logit array
-    preds = np.exp(logits - np.max(logits))/np.sum(np.exp(logits - np.max(logits)))
-    preds = np.log(preds) / temperature
-    exp_preds = np.exp(preds)
+    if temperature == 0.0 or temperature is None:
+        return np.argmax(logits)
+
+    logits = logits/temperature
+    exp_preds = np.exp(logits - np.max(logits))
     preds = exp_preds / np.sum(exp_preds)
-    # print(preds, np.sum(preds))
     return np.random.choice(range(len(logits)), p=preds)
-    probas = np.random.multinomial(1, preds, 1)
-    return np.argmax(probas)
 
 class FriendChatBot(object):
 
@@ -67,14 +66,8 @@ class FriendChatBot(object):
         self.decoder_input_pred = tf.placeholder(dtype="int32", shape=(None, 1), name="decoder_input_pred")
         decoder_embedding_pred = tf.nn.embedding_lookup(embeddings, self.decoder_input_pred)
         with tf.variable_scope("rnn", reuse=True):
-            self.decoders_c = [tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c{}".format(i)) for i in range(N_LAYERS)]
-            self.decoders_h = [tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h{}".format(i)) for i in range(N_LAYERS)]
-
-            # self.decoder_c1 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c1")
-            # self.decoder_h1 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h1")
-            # self.decoder_c2 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c2")
-            # self.decoder_h2 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h2")
-            # state = (LSTMStateTuple(self.decoder_c1, self.decoder_h1), LSTMStateTuple(self.decoder_c2, self.decoder_h2))
+            self.decoders_c = tuple(tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c{}".format(i)) for i in range(N_LAYERS))
+            self.decoders_h = tuple(tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h{}".format(i)) for i in range(N_LAYERS))
 
             state = [LSTMStateTuple(self.decoders_c[i], self.decoders_h[i]) for i in range(N_LAYERS)]
             decoder_outputs_pred, self.decoder_states_pred = self.rnn_cell(
@@ -90,7 +83,7 @@ class FriendChatBot(object):
         self.train_op = tf.train.AdamOptimizer(1e-4).minimize(self.loss_op)
         self.init_op = tf.global_variables_initializer()
 
-    def fit(self, training_data, num_epochs=999, batch_size=128):
+    def fit(self, training_data, num_epochs=9999, batch_size=128):
 
         def chunker(seq, size):
             while True:
@@ -136,7 +129,7 @@ class FriendChatBot(object):
         })
         tqdm.set_postfix(loss=loss)
 
-    def chat(self, my_name, friend_name):
+    def chat(self, my_name, friend_name, temperature=0.0):
 
         state_and_hidden = self.session.run([self.rnn_cell.zero_state(1, dtype=tf.float32)])
         state_and_hidden = state_and_hidden[0]
@@ -153,11 +146,9 @@ class FriendChatBot(object):
                 input_char = np.array([[self.preprocessor.vocabulary[char]]])
                 state_and_hidden = self.session.run([self.decoder_states_pred],
                                                      feed_dict={
-                                                         self.decoder_input_pred: input_char,
-                                                         self.decoder_c1: state_and_hidden[0].c,
-                                                         self.decoder_h1: state_and_hidden[0].h,
-                                                         self.decoder_c2: state_and_hidden[1].c,
-                                                         self.decoder_h2: state_and_hidden[1].h,
+                                                        self.decoder_input_pred: input_char,
+                                                        self.decoders_c: [x.c for x in state_and_hidden],
+                                                        self.decoders_h: [x.h for x in state_and_hidden],
                                                      })
                 state_and_hidden = state_and_hidden[0]
 
@@ -171,18 +162,12 @@ class FriendChatBot(object):
                 logits, state_and_hidden = self.session.run([self.decoder_proj_pred, self.decoder_states_pred],
                                                             feed_dict={
                                                                 self.decoder_input_pred: next_input,
-                                                                self.decoder_c1: state_and_hidden[0].c,
-                                                                self.decoder_h1: state_and_hidden[0].h,
-                                                                self.decoder_c2: state_and_hidden[1].c,
-                                                                self.decoder_h2: state_and_hidden[1].h,
+                                                                self.decoders_c: [x.c for x in state_and_hidden],
+                                                                self.decoders_h: [x.h for x in state_and_hidden],
                                                             })
 
-                # use some strategy to select next char
-                # selected = np.argmax(logits[0,:])
-                selected = sample(logits[0, :])
-
-                #probs = np.exp(logits[0,:] * 5) / np.sum(np.exp(logits[0,:] * 5))
-                #selected = np.random.choice(np.arange(0, len(probs)), p=probs)
+                # Temperature == 0 by default, can pick larger for more randomness
+                selected = sample(logits[0, :], temperature=temperature)
 
                 if not selected in (self.preprocessor.vocabulary[preprocessing.END_TOKEN],
                                     self.preprocessor.vocabulary[data.ME_START_CHAR]):
@@ -193,10 +178,8 @@ class FriendChatBot(object):
                     state_and_hidden = self.session.run([self.decoder_states_pred],
                                                         feed_dict={
                                                             self.decoder_input_pred: np.array([[self.preprocessor.vocabulary[data.ME_START_CHAR]]]),
-                                                            self.decoder_c1: state_and_hidden[0].c,
-                                                            self.decoder_h1: state_and_hidden[0].h,
-                                                            self.decoder_c2: state_and_hidden[1].c,
-                                                            self.decoder_h2: state_and_hidden[1].h,
+                                                            self.decoders_c: [x.c for x in state_and_hidden],
+                                                            self.decoders_h: [x.h for x in state_and_hidden],
                                                         })
                     state_and_hidden = state_and_hidden[0]
                     break
@@ -204,8 +187,8 @@ class FriendChatBot(object):
             print()
 
     def can_load(self):
-        checkpoints = [m.group(0) for m in
-                       map(lambda x: re.search(MODEL_CHECKPOINT_REGEX, x), os.listdir(self.save_dir)) if m]
+        regex_results = [re.search(MODEL_CHECKPOINT_REGEX, x) for x in os.listdir(self.save_dir)]
+        checkpoints = [m.group(0) for m in regex_results if m]
         return len(checkpoints) > 0
 
     def load(self):
