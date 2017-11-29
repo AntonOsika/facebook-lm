@@ -13,6 +13,17 @@ from tensorflow.contrib.rnn import LSTMStateTuple
 MODEL_CHECKPOINT_NAME = "model.ckpt"
 MODEL_CHECKPOINT_REGEX = r"^model\.ckpt-(\d+)"
 
+def sample(logits, temperature=0.000000000003):
+    # helper function to sample an index from a logit array
+    preds = np.exp(logits - np.max(logits))/np.sum(np.exp(logits - np.max(logits)))
+    preds = np.log(preds) / temperature
+    exp_preds = np.exp(preds)
+    preds = exp_preds / np.sum(exp_preds)
+    # print(preds, np.sum(preds))
+    return np.random.choice(range(len(logits)), p=preds)
+    probas = np.random.multinomial(1, preds, 1)
+    return np.argmax(probas)
+
 class FriendChatBot(object):
 
     def __init__(self, max_vocab_size, unk_token, save_dir, text_col):
@@ -27,13 +38,20 @@ class FriendChatBot(object):
         return tf.Session()
 
     def build_model(self):
+        N_LAYERS = 1
+        N_UNITS = 128
+        INPUT_KEEP_PROB = 0.8
+        OUTPUT_KEEP_PROB = 0.9
+
         vocab_size = self.preprocessor.shape[1]
 
         embeddings = tf.get_variable("word_embeddings",
                                      initializer=tf.constant(np.diag(np.ones(vocab_size)), dtype=tf.float32),
                                      trainable=False)
 
-        self.rnn_cell = tf.contrib.rnn.MultiRNNCell([tf.contrib.rnn.BasicLSTMCell(num_units=512) for _ in range(2)])
+        cells = [tf.contrib.rnn.BasicLSTMCell(num_units=N_UNITS) for _ in range(N_LAYERS)]
+        cells = [tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=INPUT_KEEP_PROB, output_keep_prob=OUTPUT_KEEP_PROB) for cell in cells]
+        self.rnn_cell = tf.contrib.rnn.MultiRNNCell(cells)
 
         # Training
         self.decoder_input_train = tf.placeholder(dtype="int32", shape=(None, None), name="decoder_input")
@@ -49,12 +67,16 @@ class FriendChatBot(object):
         self.decoder_input_pred = tf.placeholder(dtype="int32", shape=(None, 1), name="decoder_input_pred")
         decoder_embedding_pred = tf.nn.embedding_lookup(embeddings, self.decoder_input_pred)
         with tf.variable_scope("rnn", reuse=True):
-            self.decoder_c1 = tf.placeholder(dtype=tf.float32, shape=(None, 512), name="c1")
-            self.decoder_h1 = tf.placeholder(dtype=tf.float32, shape=(None, 512), name="h1")
-            self.decoder_c2 = tf.placeholder(dtype=tf.float32, shape=(None, 512), name="c2")
-            self.decoder_h2 = tf.placeholder(dtype=tf.float32, shape=(None, 512), name="h2")
-            state = (
-            LSTMStateTuple(self.decoder_c1, self.decoder_h1), LSTMStateTuple(self.decoder_c2, self.decoder_h2))
+            self.decoders_c = [tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c{}".format(i)) for i in range(N_LAYERS)]
+            self.decoders_h = [tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h{}".format(i)) for i in range(N_LAYERS)]
+
+            # self.decoder_c1 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c1")
+            # self.decoder_h1 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h1")
+            # self.decoder_c2 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="c2")
+            # self.decoder_h2 = tf.placeholder(dtype=tf.float32, shape=(None, N_UNITS), name="h2")
+            # state = (LSTMStateTuple(self.decoder_c1, self.decoder_h1), LSTMStateTuple(self.decoder_c2, self.decoder_h2))
+
+            state = [LSTMStateTuple(self.decoders_c[i], self.decoders_h[i]) for i in range(N_LAYERS)]
             decoder_outputs_pred, self.decoder_states_pred = self.rnn_cell(
                 inputs=tf.reshape(decoder_embedding_pred, shape=[-1, vocab_size]),
                 state=state)
@@ -68,7 +90,7 @@ class FriendChatBot(object):
         self.train_op = tf.train.AdamOptimizer(1e-4).minimize(self.loss_op)
         self.init_op = tf.global_variables_initializer()
 
-    def fit(self, training_data, num_epochs=999, batch_size=10):
+    def fit(self, training_data, num_epochs=999, batch_size=128):
 
         def chunker(seq, size):
             while True:
@@ -156,7 +178,8 @@ class FriendChatBot(object):
                                                             })
 
                 # use some strategy to select next char
-                selected = np.argmax(logits[0,:])
+                # selected = np.argmax(logits[0,:])
+                selected = sample(logits[0, :])
 
                 #probs = np.exp(logits[0,:] * 5) / np.sum(np.exp(logits[0,:] * 5))
                 #selected = np.random.choice(np.arange(0, len(probs)), p=probs)
